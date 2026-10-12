@@ -1,0 +1,10 @@
+# dsh bundle layer: mount the commandcode request-error recovery plugin.
+#
+# The plugin is a plain function plugin (name/inject/apply) with no client half,
+# so a single `insert` entry is enough. It is mounted at the profile root on
+# purpose: `agent/request-error` and `agent/request` are scope-filtered
+# dispatches, and only a root-scoped listener receives them for *every* agent,
+# including spawned and forked subagents.
+- insert:
+    - id: retry-for-commandcode
+      name: dsh-retry-for-commandcode

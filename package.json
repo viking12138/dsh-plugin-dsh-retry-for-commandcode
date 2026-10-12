@@ -1,0 +1,37 @@
+{
+  "name": "dsh-retry-for-commandcode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Keep DSH tasks alive when a commandcode / openai-responses route rejects a request with HTTP 400 invalid_request_error: diagnose the failed step, repair context, fail over, and retry instead of aborting.",
+  "type": "module",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test/selftest.mjs",
+    "test:integration": "node test/integration-realsession.mjs",
+    "test:all": "node test/selftest.mjs && node test/integration-realsession.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "commandcode",
+    "invalid_request_error",
+    "retry"
+  ],
+  "license": "MIT"
+}

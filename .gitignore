@@ -1,0 +1,7 @@
+# The plugin imports nothing from `@deepseek-ai/*`, so it needs no dependencies.
+node_modules/
+
+# Test / editor noise
+*.log
+.DS_Store
+Thumbs.db
