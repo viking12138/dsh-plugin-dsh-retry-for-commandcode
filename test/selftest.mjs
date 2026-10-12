@@ -25,6 +25,7 @@ import { resolveConfig } from '../lib/config.js'
 import { diagnose, renderDiagnosis } from '../lib/diagnose.js'
 import { apply } from '../lib/index.js'
 import {
+  describeRequestComposition,
   elideCandidates,
   inspectNode,
   inspectSurface,
@@ -399,6 +400,79 @@ check('rewriteNodeContent: refuses surface node 0 when it holds the system promp
   assert.equal(system.rewritable, false)
 })
 
+check('describeRequestComposition: separates the bytes this plugin can rewrite from the bytes it cannot', () => {
+  const session = buildSession()
+  const composition = describeRequestComposition(session)
+  assert.equal(composition.messages, 24)
+  assert.ok(composition.totalBytes > 40000, 'the request is measured in its JSON form')
+  assert.equal(composition.estimatedTokens, Math.ceil(composition.totalBytes / 4))
+  assert.equal(
+    composition.touchableBytes + composition.untouchableBytes,
+    composition.totalBytes,
+    'every measured byte is classified exactly once',
+  )
+  // The 40000-char tool result is reachable; the assistant message is not.
+  assert.ok(composition.touchableBytes > 40000)
+  assert.ok(composition.untouchableBytes > 0)
+  assert.equal(composition.largest.role, 'tool')
+  assert.equal(composition.untouchablePercent, Math.round((composition.untouchableBytes / composition.totalBytes) * 100))
+  const roles = composition.byRole.map(([role]) => role)
+  assert.deepEqual(roles, ['tool', 'assistant', 'user', 'system'], 'largest role first')
+})
+
+/** A session whose request is dominated by assistant text — the untouchable shape. */
+function buildAssistantHeavySession() {
+  const events = []
+  const push = (event) => events.push({ seq: events.length, time: 0, ...event })
+  push({ type: 'system/message', data: { turn: 0, step: 0, message: textMessage(0, 'system', 'You are a coding agent.') }, surfaceOp: 'append' })
+  push({ type: 'user/message', data: textMessage(1, 'user', 'Keep going.'), surfaceOp: 'append' })
+  for (let index = 0; index < 4; index += 1) {
+    push({
+      type: 'assistant/message',
+      data: {
+        turn: 1,
+        step: index + 1,
+        message: textMessage(2 + index * 2, 'assistant', 'thinking…', {
+          content: [
+            { type: 'reasoning', text: 'R'.repeat(6000) },
+            { type: 'text', text: 'I will check the invariant.' },
+            { type: 'tool-call', id: `call_${index}`, name: 'read', arguments: '{"path":"parser.ts"}' },
+          ],
+        }),
+      },
+      surfaceOp: 'append',
+    })
+    push({
+      type: 'tool/result',
+      data: { message: textMessage(3 + index * 2, 'tool', `ok ${index} `.repeat(60), { toolCallId: `call_${index}` }) },
+      surfaceOp: 'append',
+    })
+  }
+  return new MiniSession(events)
+}
+
+check('describeRequestComposition: an assistant-dominated request reports a majority it cannot rewrite', () => {
+  const composition = describeRequestComposition(buildAssistantHeavySession())
+  assert.ok(composition.untouchablePercent >= 90, `expected a dominant untouchable share, got ${composition.untouchablePercent}%`)
+  assert.equal(composition.largest.role, 'assistant')
+})
+
+check('rewriteNodeContent: no assistant node is ever a rewrite candidate', () => {
+  const session = buildAssistantHeavySession()
+  const inspection = inspectSurface(session, { topN: 5 })
+  for (const node of inspection.nodes) {
+    if (node.type !== 'assistant/message') continue
+    assert.equal(node.rewritable, false, `assistant seq ${node.seq} must not be rewritable`)
+  }
+  const cfg = resolveConfig({ elide: { keepRecentNodes: 3, minChars: 100, minTotalChars: 0 } })
+  const candidates = [...pruneCandidates(inspection, cfg), ...elideCandidates(inspection, cfg)]
+  assert.ok(candidates.length > 0, 'the small tool results are still candidates')
+  assert.ok(
+    candidates.every((node) => node.type !== 'assistant/message'),
+    'neither transform may propose an assistant node',
+  )
+})
+
 // ---------------------------------------------------------------------------
 // 5. Candidate selection
 // ---------------------------------------------------------------------------
@@ -540,10 +614,10 @@ await checkAsync('apply(): delegates a failure it does not own', async () => {
   assert.equal(action, undefined)
 })
 
-await checkAsync('apply(): delegates auth/quota even when the wording matches', async () => {
+await checkAsync('apply(): delegates auth and account-level failures the wording cannot fix', async () => {
   const ctx = makeCtx()
   apply(ctx, {})
-  for (const code of ['AUTH', 'QUOTA', 'MISSING_CREDENTIAL', 'ABORTED']) {
+  for (const code of ['AUTH', 'ACCOUNT_QUOTA', 'MISSING_CREDENTIAL', 'INVALID_CREDENTIAL', 'ABORTED']) {
     const action = await waterfall(ctx, 'agent/request-error', {
       agent: makeAgent(buildSession()),
       turn: 1,
@@ -554,6 +628,90 @@ await checkAsync('apply(): delegates auth/quota even when the wording matches', 
     })
     assert.equal(action, undefined, `${code} must not be owned`)
   }
+})
+
+await checkAsync('apply(): a route-scoped QUOTA moves to a route that still has credit', async () => {
+  // Observed in a real session: hh-commandcode answered HTTP 400 with
+  // "You have insufficient credits", which classifies as QUOTA. That key is out
+  // of credit; another route is not, so the task can continue.
+  const llm = {
+    listProviders: () => [{ id: 'hh-commandcode', name: 'hh-commandcode' }, { id: 'deepseek', name: 'deepseek' }],
+    listModels: async (provider) =>
+      provider === 'deepseek' ? [{ id: 'deepseek-flash' }] : [{ id: 'deepseek/deepseek-v4.1-flash' }],
+  }
+  const ctx = makeCtx({ services: { llm } })
+  apply(ctx, { strategies: ['failover'], failover: { mode: 'any' } })
+
+  const session = buildSession()
+  const agent = makeAgent(session)
+  const action = await waterfall(ctx, 'agent/request-error', {
+    agent,
+    turn: 7,
+    step: 6,
+    provider: 'hh-commandcode',
+    failure: {
+      code: 'QUOTA',
+      message:
+        'hh-commandcode API error (400): {"message":"You have insufficient credits to make this request. ' +
+        'Please purchase more credits to continue using the service.","type":"invalid_request_error","code":"BAD_REQUEST"}',
+    },
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(action, { kind: 'retry' }, 'a route-scoped credit failure is recoverable by switching route')
+  assert.equal(session.surface.replaceGeneration, 0, 'credit recovery must not touch history')
+
+  const seed = () => ({ provider: 'hh-commandcode', model: 'deepseek/deepseek-v4.1-flash' })
+  const config = await waterfall(
+    ctx,
+    'agent/request',
+    { agent, turn: 7, step: 6, signal: new AbortController().signal },
+    seed,
+  )
+  assert.equal(config.provider, 'deepseek', 'the retry lands on a route outside the credit-exhausted one')
+})
+
+await checkAsync('apply(): onQuota=delegate leaves a credit failure to the shipped behaviour', async () => {
+  const llm = { listProviders: () => [{ id: 'command', name: 'command' }], listModels: async () => [{ id: 'x' }] }
+  const ctx = makeCtx({ services: { llm } })
+  apply(ctx, { onQuota: 'delegate', failover: { mode: 'any' } })
+  const action = await waterfall(ctx, 'agent/request-error', {
+    agent: makeAgent(buildSession()),
+    turn: 1,
+    step: 1,
+    provider: 'hh-commandcode',
+    failure: { code: 'QUOTA', message: 'hh-commandcode API error (400): insufficient credits' },
+    signal: new AbortController().signal,
+  })
+  assert.equal(action, undefined)
+})
+
+await checkAsync('apply(): a credit failure with no other route surfaces instead of retrying a dead key', async () => {
+  // Only the failing route is registered, so there is nothing to switch to.
+  // Retrying the same key cannot restore credit, so the ladder must delegate
+  // rather than burn requests against it.
+  const llm = { listProviders: () => [{ id: 'hh-commandcode', name: 'hh-commandcode' }], listModels: async () => [] }
+  const ctx = makeCtx({ services: { llm } })
+  apply(ctx, {
+    onQuota: 'failover',
+    strategies: ['failover'],
+    onExhausted: 'retry',
+    backoff: { initialDelayMs: 1, maxDelayMs: 2, jitterRatio: 0 },
+  })
+  const action = await waterfall(ctx, 'agent/request-error', {
+    agent: makeAgent(buildSession()),
+    turn: 7,
+    step: 6,
+    provider: 'hh-commandcode',
+    failure: {
+      code: 'QUOTA',
+      message:
+        'hh-commandcode API error (400): {"message":"You have insufficient credits to make this request.",' +
+        '"type":"invalid_request_error","code":"BAD_REQUEST"}',
+    },
+    signal: new AbortController().signal,
+  })
+  assert.equal(action, undefined, 'no route switch is possible, so the quota error surfaces')
+  assert.match(ctx.lines.join('\n'), /no usable route left/)
 })
 
 await checkAsync('apply(): dryRun diagnoses but never mutates', async () => {
@@ -623,6 +781,131 @@ await checkAsync('apply(): failover rewrites the next attempt call config only',
   // And it is scoped to the turn/step that failed.
   const other = await waterfall(ctx, 'agent/request', { agent, turn: 2, step: 1, signal: new AbortController().signal }, seed)
   assert.deepEqual(other, seed())
+})
+
+await checkAsync('runLadder: consecutive failures escalate instead of repeating failover', async () => {
+  // Regression for the bug a real session exposed: turn 7 step 6 failed four
+  // times, switching hh-commandcode2 -> command -> hh-commandcode and never once
+  // trying to repair the request — because `failover` always claims progress and
+  // so was selected on every failure. A successful strategy must retire.
+  const llm = {
+    listProviders: () => [
+      { id: 'command', name: 'command' },
+      { id: 'hh-commandcode', name: 'hh-commandcode' },
+      { id: 'hh-commandcode2', name: 'hh-commandcode2' },
+    ],
+    listModels: async () => [{ id: 'deepseek/deepseek-v4.1-flash' }],
+  }
+  const ctx = makeCtx({ services: { llm } })
+  const session = buildSession()
+  const agent = makeAgent(session)
+  const cfg = resolveConfig({ strategies: ['failover', 'prune'], probeAttempts: 0 })
+  const record = {
+    key: '7:6',
+    turn: 7,
+    step: 6,
+    attempts: 0,
+    cycle: 1,
+    used: new Set(),
+    probeCount: 0,
+    askedOnce: false,
+    priority: null,
+    only: null,
+    history: [],
+    triedRoutes: new Set(),
+  }
+  const seen = []
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    record.attempts += 1
+    const outcome = await runLadder({
+      ctx,
+      cfg,
+      agent,
+      rec: record,
+      diagnosis: { isSubagent: false, suspectedCauses: [] },
+      signal: new AbortController().signal,
+      provider: 'hh-commandcode2',
+      log: () => {},
+    })
+    seen.push(outcome.strategy)
+    if (outcome.kind !== 'retry') break
+  }
+  assert.deepEqual(
+    seen,
+    ['failover', 'prune', 'failover'],
+    `unexpected sequence ${JSON.stringify(seen)}`,
+  )
+  // The point of the fix: request repair is reached on the SECOND failure, not
+  // never. Before the fix this sequence was failover, failover, failover.
+  assert.equal(seen[1], 'prune', 'the second failure repairs the request instead of switching route again')
+  assert.ok(session.surface.replaceGeneration > 0, 'the request was actually repaired')
+})
+
+await checkAsync('failoverTargets: excludes routes and reports when only other models exist', async () => {
+  const llm = {
+    listProviders: () => [
+      { id: 'hh-commandcode', name: 'hh-commandcode' },
+      { id: 'command', name: 'command' },
+      { id: 'deepseek', name: 'deepseek' },
+    ],
+    listModels: async (provider) => {
+      if (provider === 'deepseek') return [{ id: 'deepseek-flash' }]
+      return [{ id: 'deepseek/deepseek-v4.1-flash' }]
+    },
+  }
+  const logged = []
+  const ctx = makeCtx({ services: { llm } })
+  apply(ctx, {
+    strategies: ['failover'],
+    failover: { mode: 'same-model', exclude: ['hh-commandcode'] },
+  })
+  const agent = makeAgent(buildSession())
+  const action = await waterfall(ctx, 'agent/request-error', {
+    agent,
+    turn: 1,
+    step: 1,
+    provider: 'hh-commandcode2',
+    failure: realFailure,
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(action, { kind: 'retry' })
+  const config = await waterfall(
+    ctx,
+    'agent/request',
+    { agent, turn: 1, step: 1, signal: new AbortController().signal },
+    () => ({ provider: 'hh-commandcode2', model: 'deepseek/deepseek-v4.1-flash' }),
+  )
+  assert.equal(config.provider, 'command', 'the excluded alias is skipped')
+})
+
+await checkAsync('failoverTargets: warns when only other-model routes exist', async () => {
+  // same-model mode with every same-model route excluded: failover cannot help,
+  // and the log must say why instead of silently doing nothing.
+  const llm = {
+    listProviders: () => [
+      { id: 'hh-commandcode', name: 'hh-commandcode' },
+      { id: 'command', name: 'command' },
+      { id: 'deepseek', name: 'deepseek' },
+    ],
+    listModels: async (provider) =>
+      provider === 'deepseek' ? [{ id: 'deepseek-flash' }] : [{ id: 'deepseek/deepseek-v4.1-flash' }],
+  }
+  const ctx = makeCtx({ services: { llm } })
+  apply(ctx, {
+    strategies: ['failover'],
+    failover: { mode: 'same-model', exclude: ['hh-commandcode', 'command'] },
+    backoff: { initialDelayMs: 1, maxDelayMs: 2, jitterRatio: 0 },
+  })
+  await waterfall(ctx, 'agent/request-error', {
+    agent: makeAgent(buildSession()),
+    turn: 1,
+    step: 1,
+    provider: 'hh-commandcode2',
+    failure: realFailure,
+    signal: new AbortController().signal,
+  })
+  assert.match(ctx.lines.join('\n'), /only for other models/)
+  assert.match(ctx.lines.join('\n'), /set failover\.mode: 'any'/)
 })
 
 await checkAsync('apply(): a delegated subagent is recovered but never asked', async () => {
@@ -785,6 +1068,35 @@ check('diagnose/renderDiagnosis: produces a readable, provider-truthful report',
   assert.match(rendered, /status=400/)
   assert.match(rendered, /largest seq=3/)
   assert.match(rendered, /result 40000 chars/)
+  // The composition is rendered, so an operator can see how much of the request
+  // the ladder is structurally unable to touch.
+  assert.match(rendered, /request: 24 messages, [\d.]+ KB \(~\d+ tokens\), untouchable \d+%/)
+  assert.match(rendered, /role tool: /)
+  assert.match(rendered, /largest message: [\d.]+ KB role=tool/)
+})
+
+check('diagnose: an assistant-dominated request blames the untouchable share first', () => {
+  const cfg = resolveConfig({})
+  const session = buildAssistantHeavySession()
+  const diagnosis = diagnose({
+    ctx: makeCtx(),
+    cfg,
+    agent: makeAgent(session),
+    provider: 'hh-commandcode2',
+    failure: realFailure,
+    verdict: classifyFailure(realFailure, 'hh-commandcode2', cfg),
+    turn: 5,
+    step: 9,
+    attempt: 1,
+    cycle: 1,
+    strategyHistory: [],
+  })
+  const top = diagnosis.suspectedCauses[0]
+  assert.equal(top.confidence, 'high')
+  assert.match(top.cause, /% of the outgoing request .* is inside assistant messages/)
+  assert.match(top.remedy, /compact/)
+  const rendered = renderDiagnosis(diagnosis).join('\n')
+  assert.match(rendered, /untouchable 9\d%/)
 })
 
 // ---------------------------------------------------------------------------

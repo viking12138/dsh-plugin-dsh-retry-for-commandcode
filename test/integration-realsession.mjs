@@ -21,6 +21,7 @@ import { pathToFileURL } from 'node:url'
 
 import { resolveConfig } from '../lib/config.js'
 import {
+  describeRequestComposition,
   elideCandidates,
   inspectNode,
   inspectSurface,
@@ -353,6 +354,157 @@ check('invariant: every event type the plugin appends is in the harness vocabula
     )
     assert.equal(event.ignorable, undefined, 'the plugin never relies on the ignorable escape hatch')
   }
+})
+
+// ---------------------------------------------------------------------------
+// 6. The composition measurement: what the plugin can and cannot shrink
+// ---------------------------------------------------------------------------
+
+/**
+ * A session shaped like a real coding run under this route: assistant messages
+ * carry their reasoning and tool calls, and each assistant message embeds the
+ * provider replay state (`source.replayState`) that `dsh-llm-pi-ai` needs to
+ * continue the conversation. All of that lives inside `assistant/message` nodes.
+ */
+function seedAssistantHeavyEvents() {
+  const events = []
+  const push = (type, data, opts) => events.push({ type, seq: events.length, time: 1000 + events.length, data, ...opts })
+
+  push(
+    'system/message',
+    {
+      turn: 0,
+      step: 0,
+      message: { id: 'sys-1', role: 'system', content: [{ type: 'text', text: 'You are a coding agent.' }], source: { kind: 'system-prompt' } },
+    },
+    { surfaceOp: 'append' },
+  )
+  push(
+    'user/message',
+    {
+      id: 'u-1',
+      role: 'user',
+      content: [{ type: 'text', text: 'Refactor the parser and run the tests.' }],
+      source: { kind: 'user' },
+    },
+    { surfaceOp: 'append' },
+  )
+  for (let index = 0; index < 3; index += 1) {
+    const assistantSeq = events.length
+    push(
+      'assistant/message',
+      {
+        turn: 1,
+        step: index + 1,
+        // `assistant/message` carries the settled stream rather than citing it
+        // through sourceEventSeqs, which is exactly what makes the node
+        // referenceable but not shadowable.
+        stream: [],
+        message: {
+          id: `a-${index}`,
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'R'.repeat(30000) },
+            { type: 'text', text: 'I will read the parser next.' },
+            { type: 'tool-call', id: `call_${index}`, name: 'read', arguments: '{"path":"parser.ts"}' },
+          ],
+          source: {
+            kind: 'model',
+            provider: 'hh-commandcode2',
+            model: 'deepseek/deepseek-v4.1-flash',
+            // The replay blob the harness must not have rewritten under it.
+            replayState: { response: { kind: 'pi-ai', version: 2, responseId: `resp_${index}` } },
+          },
+        },
+      },
+      { surfaceOp: 'append' },
+    )
+    push(
+      'tool/result',
+      {
+        turn: 1,
+        step: index + 1,
+        message: {
+          id: `t-${index}`,
+          role: 'tool',
+          content: [{ type: 'text', text: index === 0 ? HUGE : `result ${index} `.repeat(30) }],
+          source: { kind: 'tool', callId: `call_${index}` },
+          toolCallId: `call_${index}`,
+        },
+      },
+      { surfaceOp: 'append', sourceEventSeqs: [assistantSeq] },
+    )
+  }
+  return events
+}
+
+check('composition: the real derived history splits into reachable and unreachable bytes', () => {
+  const session = createSession(seedEvents())
+  const composition = describeRequestComposition(session)
+  assert.ok(composition !== null, 'the composition is measurable on a real session')
+  assert.equal(composition.messages, 10)
+  assert.equal(
+    composition.touchableBytes + composition.untouchableBytes,
+    composition.totalBytes,
+    'every measured byte is classified exactly once',
+  )
+  // The 40000-char tool result is a `tool`-role message carrying a `text` block,
+  // which is exactly what the plugin is allowed to rewrite.
+  assert.ok(composition.touchableBytes > 40000, `expected the tool result to be reachable (${composition.touchableBytes} bytes)`)
+  assert.equal(composition.largest.role, 'tool')
+  assert.equal(composition.largest.id, 't-0')
+})
+
+check('composition: an assistant-dominated request is majority untouchable', () => {
+  const session = createSession(seedAssistantHeavyEvents())
+  const composition = describeRequestComposition(session)
+  // Three assistant messages carrying 30 KB of reasoning each vs one 40 KB tool
+  // result: the ladder can shrink the result and still leave most of the request
+  // exactly where it was.
+  assert.ok(composition.untouchablePercent > 50, `expected a majority untouchable share, got ${composition.untouchablePercent}%`)
+  assert.ok(
+    composition.untouchableBytes > composition.touchableBytes,
+    `untouchable ${composition.untouchableBytes} should exceed touchable ${composition.touchableBytes}`,
+  )
+  // Per-message the largest node is rewritable (the 40 KB tool result), but in
+  // aggregate the assistant messages dominate — which is exactly the case a
+  // "find the biggest node and prune it" reflex gets wrong.
+  assert.equal(composition.largest.role, 'tool')
+  assert.equal(composition.largest.id, 't-0')
+  assert.deepEqual(composition.byRole[0][0], 'assistant')
+})
+
+check('composition: the real Session refuses to rewrite an assistant node, with or without citations', () => {
+  const session = createSession(seedAssistantHeavyEvents())
+  const assistantSeq = 2
+  const node = inspectNode(session, assistantSeq)
+  assert.equal(node.type, 'assistant/message')
+  assert.equal(node.rewritable, false)
+  // The plugin's own path refuses it.
+  assert.equal(rewriteNodeContent(session, node, [{ type: 'text', text: 'x' }], { label: 'assistant' }), null)
+
+  // So does the harness, both ways — which is why no amount of pruning can shed
+  // this content, and why the composition reports it as untouchable.
+  const event = session.eventAt(assistantSeq)
+  const content = [{ type: 'text', text: 'rewritten' }]
+  assert.throws(
+    () =>
+      session.append(
+        'assistant/message',
+        { ...event.data, message: { ...event.data.message, content } },
+        { surfaceOp: { op: 'replace', startSeq: assistantSeq, endSeq: assistantSeq }, sourceEventSeqs: [assistantSeq] },
+      ),
+    /cannot carry sourceEventSeqs|embeds its source stream/,
+  )
+  assert.throws(
+    () =>
+      session.append(
+        'assistant/message',
+        { ...event.data, message: { ...event.data.message, content } },
+        { surfaceOp: { op: 'replace', startSeq: assistantSeq, endSeq: assistantSeq } },
+      ),
+    /sourceEventSeqs/,
+  )
 })
 
 // ---------------------------------------------------------------------------
